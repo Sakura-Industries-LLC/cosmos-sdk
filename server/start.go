@@ -126,6 +126,12 @@ type StartCmdOptions struct {
 	AddFlags func(cmd *cobra.Command)
 	// StartCommandHanlder can be used to customize the start command handler
 	StartCommandHandler func(svrCtx *Context, clientCtx client.Context, appCreator types.AppCreator, inProcessConsensus bool, opts StartCmdOptions) error
+
+	// CometSetup is called after the app is created but before the CometBFT
+	// node. It returns an optional NodeKey override and CometBFT node options
+	// (e.g. node.WithUpgradeFunc). When nil, the default LoadOrGenNodeKey
+	// behavior is used with no extra options.
+	CometSetup func(svrCtx *Context, app types.Application) (*p2p.NodeKey, []node.Option, error)
 }
 
 // StartCmd runs the service passed in, either stand-alone or in-process with
@@ -319,7 +325,7 @@ func startInProcess(svrCtx *Context, svrCfg serverconfig.Config, clientCtx clien
 		svrCfg.GRPC.Enable = true
 	} else {
 		svrCtx.Logger.Info("starting node with ABCI CometBFT in-process")
-		tmNode, cleanupFn, err := startCmtNode(ctx, cmtCfg, app, svrCtx)
+		tmNode, cleanupFn, err := startCmtNode(ctx, cmtCfg, app, svrCtx, opts)
 		if err != nil {
 			return err
 		}
@@ -366,10 +372,24 @@ func startCmtNode(
 	cfg *cmtcfg.Config,
 	app types.Application,
 	svrCtx *Context,
+	opts StartCmdOptions,
 ) (tmNode *node.Node, cleanupFn func(), err error) {
-	nodeKey, err := p2p.LoadOrGenNodeKey(cfg.NodeKeyFile())
-	if err != nil {
-		return nil, cleanupFn, err
+	var (
+		nodeKey *p2p.NodeKey
+		cmtOpts []node.Option
+	)
+
+	if opts.CometSetup != nil {
+		nodeKey, cmtOpts, err = opts.CometSetup(svrCtx, app)
+		if err != nil {
+			return nil, nil, fmt.Errorf("comet setup: %w", err)
+		}
+	}
+	if nodeKey == nil {
+		nodeKey, err = p2p.LoadOrGenNodeKey(cfg.NodeKeyFile())
+		if err != nil {
+			return nil, cleanupFn, err
+		}
 	}
 
 	cmtApp := NewCometABCIWrapper(app)
@@ -383,6 +403,7 @@ func startCmtNode(
 		cmtcfg.DefaultDBProvider,
 		node.DefaultMetricsProvider(cfg.Instrumentation),
 		servercmtlog.CometLoggerWrapper{Logger: svrCtx.Logger},
+		cmtOpts...,
 	)
 	if err != nil {
 		return tmNode, cleanupFn, err
