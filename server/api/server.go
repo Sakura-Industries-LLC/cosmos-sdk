@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -36,6 +37,10 @@ type Server struct {
 	GRPCSrv           *grpc.Server
 	logger            log.Logger
 	metrics           *telemetry.Metrics
+
+	// TLSConfig, when set, wraps the API listener with tls.NewListener
+	// for mutual TLS (e.g. DNTLS mTLS).
+	TLSConfig *tls.Config
 
 	// Start() is blocking and generally called from a separate goroutine.
 	// Close() can be called asynchronously and access shared memory
@@ -122,6 +127,11 @@ func (s *Server) Start(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		s.mtx.Unlock()
 		return err
+	}
+
+	if s.TLSConfig != nil {
+		listener = tls.NewListener(listener, s.TLSConfig)
+		s.logger.Info("API listener using DNTLS mTLS", "address", cfg.API.Address)
 	}
 
 	s.listener = listener

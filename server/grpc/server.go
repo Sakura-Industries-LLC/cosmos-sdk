@@ -2,6 +2,7 @@ package grpc
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 
@@ -137,10 +138,15 @@ func setupHistoricalGRPCConnections(
 // Note, this creates a blocking process if the server is started successfully.
 // Otherwise, an error is returned. The caller is expected to provide a Context
 // that is properly canceled or closed to indicate the server should be stopped.
-func StartGRPCServer(ctx context.Context, logger log.Logger, cfg config.GRPCConfig, grpcSrv *grpc.Server) error {
+func StartGRPCServer(ctx context.Context, logger log.Logger, cfg config.GRPCConfig, grpcSrv *grpc.Server, tlsConfig *tls.Config) error {
 	listener, err := net.Listen("tcp", cfg.Address)
 	if err != nil {
 		return fmt.Errorf("failed to listen on address %s: %w", cfg.Address, err)
+	}
+
+	if tlsConfig != nil {
+		listener = tls.NewListener(listener, tlsConfig)
+		logger.Info("gRPC listener using DNTLS mTLS", "address", cfg.Address)
 	}
 
 	errCh := make(chan error)

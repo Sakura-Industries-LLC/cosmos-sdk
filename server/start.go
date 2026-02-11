@@ -33,7 +33,10 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"golang.org/x/sync/errgroup"
+	stdtls "crypto/tls"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pruningtypes "cosmossdk.io/store/pruning/types"
@@ -132,6 +135,14 @@ type StartCmdOptions struct {
 	// (e.g. node.WithUpgradeFunc). When nil, the default LoadOrGenNodeKey
 	// behavior is used with no extra options.
 	CometSetup func(svrCtx *Context, app types.Application) (*p2p.NodeKey, []node.Option, error)
+
+	// SDKServerTLSFunc, when set, is called to obtain a TLS config for
+	// wrapping the SDK API and gRPC listeners with tls.NewListener for
+	// mutual TLS. The internal gRPC-gateway client is automatically
+	// configured with matching TLS credentials. A func is used rather
+	// than a static *tls.Config because the config is typically produced
+	// by CometSetup, which runs after StartCmdOptions is constructed.
+	SDKServerTLSFunc func() *stdtls.Config
 }
 
 // StartCmd runs the service passed in, either stand-alone or in-process with
@@ -246,6 +257,11 @@ func start(svrCtx *Context, clientCtx client.Context, appCreator types.AppCreato
 }
 
 func startStandAlone(svrCtx *Context, svrCfg serverconfig.Config, clientCtx client.Context, app types.Application, metrics *telemetry.Metrics, opts StartCmdOptions) error {
+	var sdkTLSConfig *stdtls.Config
+	if opts.SDKServerTLSFunc != nil {
+		sdkTLSConfig = opts.SDKServerTLSFunc()
+	}
+
 	addr := svrCtx.Viper.GetString(flagAddress)
 	transport := svrCtx.Viper.GetString(flagTransport)
 
@@ -279,12 +295,12 @@ func startStandAlone(svrCtx *Context, svrCfg serverconfig.Config, clientCtx clie
 		app.RegisterNodeService(clientCtx, svrCfg)
 	}
 
-	grpcSrv, clientCtx, err := StartGrpcServer(ctx, g, svrCfg.GRPC, clientCtx, svrCtx, app)
+	grpcSrv, clientCtx, err := StartGrpcServer(ctx, g, svrCfg.GRPC, clientCtx, svrCtx, app, sdkTLSConfig)
 	if err != nil {
 		return err
 	}
 
-	err = startAPIServer(ctx, g, svrCfg, clientCtx, svrCtx, app, svrCtx.Config.RootDir, grpcSrv, metrics)
+	err = startAPIServer(ctx, g, svrCfg, clientCtx, svrCtx, app, svrCtx.Config.RootDir, grpcSrv, metrics, sdkTLSConfig)
 	if err != nil {
 		return err
 	}
@@ -345,12 +361,19 @@ func startInProcess(svrCtx *Context, svrCfg serverconfig.Config, clientCtx clien
 		}
 	}
 
-	grpcSrv, clientCtx, err := StartGrpcServer(ctx, g, svrCfg.GRPC, clientCtx, svrCtx, app)
+	// Resolve SDK server TLS config after CometSetup has run (which is
+	// where the TLS handshaker is typically created).
+	var sdkTLSConfig *stdtls.Config
+	if opts.SDKServerTLSFunc != nil {
+		sdkTLSConfig = opts.SDKServerTLSFunc()
+	}
+
+	grpcSrv, clientCtx, err := StartGrpcServer(ctx, g, svrCfg.GRPC, clientCtx, svrCtx, app, sdkTLSConfig)
 	if err != nil {
 		return err
 	}
 
-	err = startAPIServer(ctx, g, svrCfg, clientCtx, svrCtx, app, cmtCfg.RootDir, grpcSrv, metrics)
+	err = startAPIServer(ctx, g, svrCfg, clientCtx, svrCtx, app, cmtCfg.RootDir, grpcSrv, metrics, sdkTLSConfig)
 	if err != nil {
 		return err
 	}
@@ -486,6 +509,7 @@ func StartGrpcServer(
 	clientCtx client.Context,
 	svrCtx *Context,
 	app types.Application,
+	tlsConfig *stdtls.Config,
 ) (*grpc.Server, client.Context, error) {
 	if !config.Enable {
 		// return grpcServer as nil if gRPC is disabled
@@ -506,10 +530,25 @@ func StartGrpcServer(
 		maxRecvMsgSize = serverconfig.DefaultGRPCMaxRecvMsgSize
 	}
 
+	// Configure gRPC client transport credentials. When TLS is active on the
+	// gRPC listener, the internal gRPC-gateway client must also use TLS.
+	// Since this is a loopback connection (same process), we present our cert
+	// but skip DNTLS peer verification.
+	var dialCreds credentials.TransportCredentials
+	if tlsConfig != nil {
+		dialCreds = credentials.NewTLS(&stdtls.Config{
+			Certificates:       tlsConfig.Certificates,
+			InsecureSkipVerify: true,
+			MinVersion:         stdtls.VersionTLS13,
+		})
+	} else {
+		dialCreds = insecure.NewCredentials()
+	}
+
 	// if gRPC is enabled, configure gRPC client for gRPC gateway
 	grpcClient, err := grpc.NewClient(
 		config.Address,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(dialCreds),
 		grpc.WithDefaultCallOptions(
 			grpc.ForceCodec(codec.NewProtoCodec(clientCtx.InterfaceRegistry).GRPCCodec()),
 			grpc.MaxCallRecvMsgSize(maxRecvMsgSize),
@@ -533,7 +572,7 @@ func StartGrpcServer(
 	// Start the gRPC server in a goroutine. Note, the provided ctx will ensure
 	// that the server is gracefully shut down.
 	g.Go(func() error {
-		return servergrpc.StartGRPCServer(ctx, logger, config, grpcSrv)
+		return servergrpc.StartGRPCServer(ctx, logger, config, grpcSrv, tlsConfig)
 	})
 	return grpcSrv, clientCtx, nil
 }
@@ -548,6 +587,7 @@ func startAPIServer(
 	home string,
 	grpcSrv *grpc.Server,
 	metrics *telemetry.Metrics,
+	tlsConfig *stdtls.Config,
 ) error {
 	if !svrCfg.API.Enable {
 		return nil
@@ -556,6 +596,9 @@ func startAPIServer(
 	clientCtx = clientCtx.WithHomeDir(home)
 
 	apiSrv := api.New(clientCtx, svrCtx.Logger.With("module", "api-server"), grpcSrv)
+	if tlsConfig != nil {
+		apiSrv.TLSConfig = tlsConfig
+	}
 	app.RegisterAPIRoutes(apiSrv, svrCfg.API)
 
 	if svrCfg.Telemetry.Enabled {
